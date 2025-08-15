@@ -17,7 +17,7 @@ const DO_CATCH_ALL_CHECK = (process.env.CATCH_ALL || "true").toLowerCase() === "
 
 const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/* Provider patterns that typically block SMTP verification */
+/* Providers that typically block SMTP verification */
 const providerBlocks = [
   { name: "gmail", domains: ["gmail.com", "googlemail.com"], mxContains: ["google.com"] },
   { name: "outlook", domains: ["outlook.com", "hotmail.com", "live.com"], mxContains: ["protection.outlook.com", "outlook.com"] },
@@ -47,7 +47,7 @@ app.get("/check", async (req, res) => {
     } catch (e) {
       return res.json(out({
         email, domain, status: "invalid_domain",
-        error: reasonFromErr(e),
+        error: reasonFromErr(e).message,
         started
       }));
     }
@@ -57,24 +57,23 @@ app.get("/check", async (req, res) => {
 
     // 1a) Detect providers that block verification
     const provider = detectBlockingProvider(domain, mxRecords);
-    // We'll still try; but if it fails with soft errors, return provider_blocks_verification.
 
     // 2) Try up to MAX_MX_TRIES hosts
     let lastErr = null;
     for (const mx of mxRecords.slice(0, MAX_MX_TRIES)) {
       try {
         const result = await smtpProbe(mx.exchange, email);
-        // Optionally catch-all check (only if first probe shows existence)
+
+        // Optional catch-all detection when mailbox seems to exist
         if (DO_CATCH_ALL_CHECK && result.status === "exists") {
           const randomLocal = `${localPart}+${crypto.randomBytes(6).toString("hex")}`;
           const randomAddr = `${randomLocal}@${domain}`;
           try {
             const ca = await smtpProbe(mx.exchange, randomAddr, /*short*/ true);
-            if (ca.status === "exists") {
-              result.status = "catch_all";
-            }
-          } catch { /* ignore catch-all probe errors */ }
+            if (ca.status === "exists") result.status = "catch_all";
+          } catch { /* ignore */ }
         }
+
         return res.json(out({
           email, domain,
           status: result.status,
@@ -85,8 +84,7 @@ app.get("/check", async (req, res) => {
           started
         }));
       } catch (e) {
-        lastErr = e;
-        // try next MX
+        lastErr = e; // try next MX
       }
     }
 
@@ -94,7 +92,6 @@ app.get("/check", async (req, res) => {
     const errReason = reasonFromErr(lastErr);
     const softFail = ["timeout", "refused", "tls", "network", "temp"].includes(errReason.kind);
 
-    // If we detected a blocking provider and all attempts were soft failures, report that explicitly
     if (provider && softFail) {
       return res.json(out({
         email, domain, status: "provider_blocks_verification",
@@ -142,7 +139,6 @@ async function smtpProbe(mxHost, targetEmail, short = false) {
 
   let connected = false;
   try {
-    // connect with robust error handling
     await new Promise((resolve, reject) => {
       const onError = (err) => { conn.off("error", onError); try { conn.close(); } catch {} reject(err); };
       conn.on("error", onError);
@@ -153,7 +149,6 @@ async function smtpProbe(mxHost, targetEmail, short = false) {
       });
     });
 
-    // HELO / MAIL / RCPT
     await sendCmd(conn, `HELO ${HELO_NAME}`);
     await sendCmd(conn, `MAIL FROM:<${PROBE_FROM}>`);
     const { code: rcptCode, text: rcptMsg } = await sendCmd(conn, `RCPT TO:<${targetEmail}>`, true);
@@ -170,7 +165,6 @@ async function smtpProbe(mxHost, targetEmail, short = false) {
   }
 }
 
-// Send a raw SMTP command and parse reply
 function sendCmd(conn, line, capture = false) {
   return new Promise((resolve, reject) => {
     conn.sendCommand(line, false, (err) => {
@@ -198,19 +192,15 @@ function out({ email, domain = null, status, mx_used = null, smtp_code = null, s
   };
 }
 
-// Normalize error messages
 function reasonFromErr(e) {
   if (!e) return { kind: "unknown", message: "Unknown error" };
   const msg = String(e && e.message ? e.message : e);
-
-  // Common Node/SMTP errors
   if (/timeout/i.test(msg) || /ETIMEDOUT/.test(msg)) return { kind: "timeout", message: "Connection timeout" };
   if (/ECONNREFUSED/.test(msg)) return { kind: "refused", message: "Connection refused" };
   if (/ENOTFOUND|EAI_AGAIN/.test(msg)) return { kind: "dns", message: "DNS failure" };
   if (/TLS|certificate|handshake/i.test(msg)) return { kind: "tls", message: "TLS error" };
   if (/greet/i.test(msg)) return { kind: "greeting", message: "SMTP greeting error" };
   if (/AggregateError/i.test(msg)) return { kind: "temp", message: "Provider aggregate/anti-abuse response" };
-
   return { kind: "other", message: msg };
 }
 
